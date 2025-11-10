@@ -8,11 +8,6 @@ import { invalidateCacheFor } from "../../utils/invalidateCache";
 import { getCache, setCache } from "../../utils/cache";
 
 
-
-
-
-
-
 const addHotel = async (req: Request, res: Response, next: NextFunction) => {
   let connection;
   try {
@@ -320,20 +315,16 @@ const getAllHotelsWithRooms = async (req: Request, res: Response, next: NextFunc
     }
 
     //  Fetch rooms (with availability count per hotel)
-    const [rooms] = await connection.query<any[]>(
-      `SELECT 
-          r.hotel_id,
-          r.room_number,
-          r.room_type,
-          r.price_per_night,
-          r.is_available
-       FROM rooms r
-       WHERE r.hotel_id IN (?)`,
+  const [rooms] = await connection.query<any[]>(
+      `SELECT hotel_id, room_number, room_type, price_per_night, is_available
+       FROM rooms
+       WHERE hotel_id IN (?)`,
       [hotelIds]
     );
 
     //  Aggregate available rooms by hotel_id
     const availableRoomsCount: Record<string, number> = {};
+    
     for (const room of rooms) {
       if (room.is_available) {
         availableRoomsCount[room.hotel_id] =(availableRoomsCount[room.hotel_id] || 0) + 1;
@@ -370,20 +361,52 @@ const [reviewSummary] = await connection.query<any[]>(
   [hotelIds]
 );
 
-const [bookings] = await connection.query<any[]>(
-  `SELECT hotel_id,COUNT(*) AS total_bookings FROM bookings WHERE hotel_id IN (?)
-  AND booking_status NOT IN ('cancelled')
-  GROUP BY hotel_id`,
-  [hotelIds]
-)
+// const [bookings] = await connection.query<any[]>(
+//   `SELECT hotel_id, cust.customer_name,br.*, COUNT(*) AS total_bookings 
+//   FROM bookings
+//   LEFT JOIN(
+//     SELECT customer_id, full_name AS customer_name
+//     FROM customers
+//   )AS cust ON bookings.customer_id = cust.customer_id
+//   LEFT JOIN booking_rooms br ON bookings.booking_id = br.booking_id
 
+
+//    WHERE hotel_id IN (?)
+
+//   GROUP BY hotel_id`,
+//   [hotelIds]
+// )
+const [bookings] = await connection.query<any[]>(
+  `
+  SELECT 
+    b.booking_id, 
+    b.hotel_id, 
+    b.customer_id, 
+    b.total_amount, 
+    b.booking_status,
+    cust.full_name AS customer_name,
+    br.room_number, 
+    br.check_in, 
+    br.check_out, 
+    br.room_amount,
+    bc.cancel_reasons
+  FROM bookings b
+  LEFT JOIN customers cust ON b.customer_id = cust.customer_id
+  LEFT JOIN booking_rooms br ON b.booking_id = br.booking_id
+  LEFT JOIN bookings_cancelled bc ON b.booking_id = bc.booking_id
+  WHERE b.hotel_id IN (?)
+  ORDER BY b.created_at DESC
+  `,
+  [hotelIds]
+);
 const totalBookings: Record<string, number> = {};
-for(const book of bookings){
-  totalBookings[book.hotel_id]= (totalBookings[book.hotel_id]||0) +1
+for (const b of bookings) {
+  if (b.booking_status !== "Cancelled") {
+    totalBookings[b.hotel_id] = (totalBookings[b.hotel_id] || 0) + 1;
+  }
 }
 
-
-console.log("reviews", reviews, bookings);
+console.log( bookings);
 // 🔹 Map average ratings for quick lookup
 const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
 for (const summary of reviewSummary) {
@@ -440,11 +463,36 @@ for (const summary of reviewSummary) {
       })
     }
     
-    // for(const book of bookings){
-    //   hotelMap[book.hotel_id].bookings.push({
-    //     total_bookings: book.total_bookings
-    //   })
-    // }
+// 🧾 Step 8: Bookings (attach booking + room details)
+for (const b of bookings) {
+  const hotel = hotelMap[b.hotel_id];
+  if (!hotel) continue;
+
+  let existingBooking = hotel.bookings.find(
+    (bk: any) => bk.booking_id === b.booking_id
+  );
+
+  if (!existingBooking) {
+    existingBooking = {
+      booking_id: b.booking_id,
+      customer_name: b.customer_name,
+      status: b.booking_status,
+      total_amount: b.total_amount,
+      cancel_reason: b.cancel_reasons || null,
+      rooms: []
+      
+    };
+    hotel.bookings.push(existingBooking);
+  }
+
+  // Add room details to that booking
+  existingBooking.rooms.push({
+    room_number: b.room_number,
+    check_in: b.check_in,
+    check_out: b.check_out,
+    room_amount: b.room_amount,
+  });
+}
     
     //  Get total hotel count
     const [countResult] = await connection.query<any[]>(
@@ -463,7 +511,7 @@ for (const summary of reviewSummary) {
     setCache(`hotels:page=${page}`, responseData, 300);
     return res.status(200).json(responseData);
   } catch (err: any) {
-     if (connection) await connection.rollback();
+    if (connection) connection.release();
     console.error("❌ Error getting hotels:", err.message);
     next(err);
   } finally {
@@ -471,372 +519,481 @@ for (const summary of reviewSummary) {
   }
 };
 
-const filterHotelsByRoomsAvailability = async (req: Request, res: Response, next: NextFunction) => {
-  let connection;
-  try {
-    connection = await db.getConnection();
+// const filterHotelsByRoomsAvailability = async (req: Request, res: Response, next: NextFunction) => {
+//   let connection;
+//   try {
+//     connection = await db.getConnection();
 
-    const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
-    const limit = 10;
-    const offset = (page - 1) * limit;
-    const sortHotelByRoomAvailability = (req.query.sortHotelByRoomAvailability as string)?.toLowerCase() || "";
+//     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
+//     const limit = 10;
+//     const offset = (page - 1) * limit;
+//     const sortHotelByRoomAvailability = (req.query.sortHotelByRoomAvailability as string)?.toLowerCase() || "";
 
-    const cacheKey = `hotels:sortByAvailability=${sortHotelByRoomAvailability}:page=${page}`;
-    const cached = getCache<any>(cacheKey);
+//     const cacheKey = `hotels:sortByAvailability=${sortHotelByRoomAvailability}:page=${page}`;
+//     const cached = getCache<any>(cacheKey);
 
-    if (cached) {
-      console.log("⚡ Cache hit:", cacheKey);
-      return res.status(200).json(cached);
-    }
+//     if (cached) {
+//       console.log("⚡ Cache hit:", cacheKey);
+//       return res.status(200).json(cached);
+//     }
 
-    console.log("🕵️ Cache miss:", cacheKey);
+//     console.log("🕵️ Cache miss:", cacheKey);
 
-    // 🔹 Step 1: Get paginated hotels
-    const [hotels] = await connection.query<any[]>(
-      `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
-       FROM hotels
-       ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
-    );
+//     // 🔹 Step 1: Get paginated hotels
+//     const [hotels] = await connection.query<any[]>(
+//       `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
+//        FROM hotels
+//        ORDER BY created_at DESC
+//        LIMIT ? OFFSET ?`,
+//       [limit, offset]
+//     );
 
-    if (hotels.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: [],
-        message: "No hotels found",
-      });
-    }
+//     if (hotels.length === 0) {
+//       return res.status(200).json({
+//         success: true,
+//         data: [],
+//         message: "No hotels found",
+//       });
+//     }
 
-    const hotelIds = hotels.map((h) => h.hotel_id);
+//     const hotelIds = hotels.map((h) => h.hotel_id);
 
-    // 🔹 Step 2: Get rooms and their availability
-    const [rooms] = await connection.query<any[]>(
-      `SELECT hotel_id, room_number, room_type, price_per_night, is_available
-       FROM rooms
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
-    const availableRoomsCount: Record<string, number> = {};
-    for (const room of rooms) {
-      if (room.is_available) {
-        availableRoomsCount[room.hotel_id] =(availableRoomsCount[room.hotel_id] || 0) + 1;
-      }
-    }
-    // 🔹 Step 3: Get services
-    const [services] = await connection.query<any[]>(
-      `SELECT hotel_id, service_id, service_name, service_charge
-       FROM services
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
-
-
-    const [reviews]= await connection.query<any[]>(
-      `SELECT hotel_id, rating, 
-      comment,review_date, cust.customer_name
-      FROM reviews
-       LEFT JOIN(
-       SELECT customer_id, full_name AS customer_name
-       FROM customers
-       )AS cust ON reviews.customer_id = cust.customer_id
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
-const [reviewSummary] = await connection.query<any[]>(
-  `SELECT hotel_id,
-          ROUND(AVG(rating), 2) AS avg_rating,
-          COUNT(*) AS total_reviews
-   FROM reviews
-   WHERE hotel_id IN (?)
-   GROUP BY hotel_id`,
-  [hotelIds]
-);
-
-const [bookings] = await connection.query<any[]>(
-  `SELECT hotel_id,COUNT(*) AS total_bookings FROM bookings WHERE hotel_id IN (?)
-  AND booking_status NOT IN ('cancelled')
-  GROUP BY hotel_id`,
-  [hotelIds]
-)
-
-const totalBookings: Record<string, number> = {};
-for(const book of bookings){
-  totalBookings[book.hotel_id]= (totalBookings[book.hotel_id]||0) +1
-}
-
-// 🔹 Map average ratings for quick lookup
-const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
-for (const summary of reviewSummary) {
-  averageRatingOfHotels[summary.hotel_id] = {
-    avg_rating: summary.avg_rating,
-    total_reviews: summary.total_reviews,
-  };
-}
-    // 🔹 Step 4: Aggregate rooms & services by hotel
-    const hotelMap: Record<string, any> = {};
-
-    for (const hotel of hotels) {
-      hotelMap[hotel.hotel_id] = {
-        ...hotel,
-        total_rooms_available: availableRoomsCount[hotel.hotel_id] || 0, // ✅ computed
-                 average_rating: averageRatingOfHotels[hotel.hotel_id]?.avg_rating || 0,
-    total_reviews: averageRatingOfHotels[hotel.hotel_id]?.total_reviews || 0,
-    totalBookings: totalBookings[hotel.hotel_id] || 0,
-        rooms: [],
-        services: [],
-        reviews:[]
-      };
-    }
-
-    // Aggregate rooms
-    for (const room of rooms) {
-      const h = hotelMap[room.hotel_id];
-      if (h) {
-        h.rooms.push({
-          room_number: room.room_number,
-          room_type: room.room_type,
-          price_per_night: room.price_per_night,
-          is_available: room.is_available,
-        });
-        if (room.is_available) h.total_rooms_available++;
-      }
-    }
-
-    // Aggregate services
-    for (const serv of services) {
-      const h = hotelMap[serv.hotel_id];
-      if (h) {
-        h.services.push({
-          service_id: serv.service_id,
-          service_name: serv.service_name,
-          service_charge: serv.service_charge,
-        });
-      }
-    }
-  for(const rev of reviews){
-      hotelMap[rev.hotel_id].reviews.push({
-        customer_name: rev.customer_name,
-        rating: rev.rating,
-        comment: rev.comment,
-        review_date: rev.review_date
-      })
-    }
-    // 🔹 Step 5: Sort hotels by available rooms (in-memory)
-    let sortedHotels = Object.values(hotelMap);
-    if (sortHotelByRoomAvailability === "low to high") {
-      sortedHotels = sortedHotels.sort((a, b) => a.total_rooms_available - b.total_rooms_available);
-    } else if (sortHotelByRoomAvailability === "high to low") {
-      sortedHotels = sortedHotels.sort((a, b) => b.total_rooms_available - a.total_rooms_available);
-    }
-
-    // 🔹 Step 6: Get total count
-    const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
-
-    const responseData = {
-      success: true,
-      totalHotels: countResult[0].total,
-      currentPage: page,
-      totalPages: Math.ceil(countResult[0].total / limit),
-      data: sortedHotels,
-    };
-
-    setCache(cacheKey, responseData, 300);
-    return res.status(200).json(responseData);
-
-  } catch (err: any) {
-     if (connection) await connection.rollback();
-    console.error("❌ Error filtering hotels:", err.message);
-    next(err);
-  } finally {
-    if (connection) connection.release();
-  }
-};
+//     // 🔹 Step 2: Get rooms and their availability
+//     const [rooms] = await connection.query<any[]>(
+//       `SELECT hotel_id, room_number, room_type, price_per_night, is_available
+//        FROM rooms
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+//     const availableRoomsCount: Record<string, number> = {};
+//     for (const room of rooms) {
+     
+//       if( room.is_available) {
+//         availableRoomsCount[room.hotel_id] =availableRoomsCount[room.hotel_id] || 0;
+//       }
+//     }
+//     // 🔹 Step 3: Get services
+//     const [services] = await connection.query<any[]>(
+//       `SELECT hotel_id, service_id, service_name, service_charge
+//        FROM services
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
 
 
-const filterHotelsByRatings = async (req: Request, res: Response, next: NextFunction) => {
-  let connection;
-  try {
-    connection = await db.getConnection();
+//     const [reviews]= await connection.query<any[]>(
+//       `SELECT hotel_id, rating, 
+//       comment,review_date, cust.customer_name
+//       FROM reviews
+//        LEFT JOIN(
+//        SELECT customer_id, full_name AS customer_name
+//        FROM customers
+//        )AS cust ON reviews.customer_id = cust.customer_id
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+// const [reviewSummary] = await connection.query<any[]>(
+//   `SELECT hotel_id,
+//           ROUND(AVG(rating), 2) AS avg_rating,
+//           COUNT(*) AS total_reviews
+//    FROM reviews
+//    WHERE hotel_id IN (?)
+//    GROUP BY hotel_id`,
+//   [hotelIds]
+// );
 
-    const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
-    const limit = 10;
-    const offset = (page - 1) * limit;
-    const ratings = (req.query.ratings as string)?.toLowerCase() || "";
+// // const [bookings] = await connection.query<any[]>(
+// //   `SELECT hotel_id,COUNT(*) AS total_bookings FROM bookings WHERE hotel_id IN (?)
+// //   AND booking_status NOT IN ('cancelled')
+// //   GROUP BY hotel_id`,
+// //   [hotelIds]
+// // )
 
-    const cacheKey = `hotels:sortByRating=${ratings}:page=${page}`;
-    const cached = getCache<any>(cacheKey);
+// // const totalBookings: Record<string, number> = {};
+// // for(const book of bookings){
+// //   totalBookings[book.hotel_id]= (totalBookings[book.hotel_id]||0) +1
+// // }
+// const [bookings] = await connection.query<any[]>(
+//   `
+//   SELECT 
+//     b.booking_id, 
+//     b.hotel_id, 
+//     b.customer_id, 
+//     b.total_amount, 
+//     b.booking_status,
+//     cust.full_name AS customer_name,
+//     br.room_number, 
+//     br.check_in, 
+//     br.check_out, 
+//     br.room_amount,
+//     bc.cancel_reasons
+//   FROM bookings b
+//   LEFT JOIN customers cust ON b.customer_id = cust.customer_id
+//   LEFT JOIN booking_rooms br ON b.booking_id = br.booking_id
+//   LEFT JOIN bookings_cancelled bc ON b.booking_id = bc.booking_id
+//   WHERE b.hotel_id IN (?)
+//   ORDER BY b.created_at DESC
+//   `,
+//   [hotelIds]
+// );
+// const totalBookings: Record<string, number> = {};
+// for (const b of bookings) {
+//   if (b.booking_status !== "Cancelled") {
+//     totalBookings[b.hotel_id] = (totalBookings[b.hotel_id] || 0) + 1;
+//   }
+// }
+// // 🔹 Map average ratings for quick lookup
+// const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
+// for (const summary of reviewSummary) {
+//   averageRatingOfHotels[summary.hotel_id] = {
+//     avg_rating: summary.avg_rating,
+//     total_reviews: summary.total_reviews,
+//   };
+// }
+//     // 🔹 Step 4: Aggregate rooms & services by hotel
+//     const hotelMap: Record<string, any> = {};
 
-    if (cached) {
-      console.log("⚡ Cache hit:", cacheKey);
-      return res.status(200).json(cached);
-    }
+//     for (const hotel of hotels) {
+//       hotelMap[hotel.hotel_id] = {
+//         ...hotel,
+//         total_rooms_available: availableRoomsCount[hotel.hotel_id] || 0, // ✅ computed
+//                  average_rating: averageRatingOfHotels[hotel.hotel_id]?.avg_rating || 0,
+//     total_reviews: averageRatingOfHotels[hotel.hotel_id]?.total_reviews || 0,
+//     totalBookings: totalBookings[hotel.hotel_id] || 0,
+//         rooms: [],
+//         services: [],
+//         reviews:[],
+//         bookings:[]
+//       };
+//     }
 
-    console.log("🕵️ Cache miss:", cacheKey);
+//     // Aggregate rooms
+//     for (const room of rooms) {
+//       const h = hotelMap[room.hotel_id];
+//       if (h) {
+//         h.rooms.push({
+//           room_number: room.room_number,
+//           room_type: room.room_type,
+//           price_per_night: room.price_per_night,
+//           is_available: room.is_available,
+//         });
+//         if (room.is_available) h.total_rooms_available++;
+//       }
+//     }
 
-    // 🔹 Step 1: Get paginated hotels
-    const [hotels] = await connection.query<any[]>(
-      `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
-       FROM hotels
-       ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
-    );
+//     // Aggregate services
+//     for (const serv of services) {
+//       const h = hotelMap[serv.hotel_id];
+//       if (h) {
+//         h.services.push({
+//           service_id: serv.service_id,
+//           service_name: serv.service_name,
+//           service_charge: serv.service_charge,
+//         });
+//       }
+//     }
+//   for(const rev of reviews){
+//       hotelMap[rev.hotel_id].reviews.push({
+//         customer_name: rev.customer_name,
+//         rating: rev.rating,
+//         comment: rev.comment,
+//         review_date: rev.review_date
+//       })
+//     }
+//     // 🧾 Step 8: Bookings (attach booking + room details)
+// for (const b of bookings) {
+//   const hotel = hotelMap[b.hotel_id];
+//   if (!hotel) continue;
 
-    if (hotels.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: [],
-        message: "No hotels found",
-      });
-    }
+//   let existingBooking = hotel.bookings.find(
+//     (bk: any) => bk.booking_id === b.booking_id
+//   );
 
-    const hotelIds = hotels.map((h) => h.hotel_id);
+//   if (!existingBooking) {
+//     existingBooking = {
+//       booking_id: b.booking_id,
+//       customer_name: b.customer_name,
+//       status: b.booking_status,
+//       total_amount: b.total_amount,
+//       cancel_reason: b.cancel_reasons || null,
+//       rooms: []
+      
+//     };
+//     hotel.bookings.push(existingBooking);
+//   }
 
-    // 🔹 Step 2: Get rooms and their availability
-    const [rooms] = await connection.query<any[]>(
-      `SELECT hotel_id, room_number, room_type, price_per_night, is_available
-       FROM rooms
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
-    const availableRoomsCount: Record<string, number> = {};
-    for (const room of rooms) {
-      if (room.is_available) {
-        availableRoomsCount[room.hotel_id] =(availableRoomsCount[room.hotel_id] || 0) + 1;
-      }
-    }
-    // 🔹 Step 3: Get services
-    const [services] = await connection.query<any[]>(
-      `SELECT hotel_id, service_id, service_name, service_charge
-       FROM services
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
+//   // Add room details to that booking
+//   existingBooking.rooms.push({
+//     room_number: b.room_number,
+//     check_in: b.check_in,
+//     check_out: b.check_out,
+//     room_amount: b.room_amount,
+//   });
+// }
+//     // 🔹 Step 5: Sort hotels by available rooms (in-memory)
+//     let sortedHotels = Object.values(hotelMap);
+//     if (sortHotelByRoomAvailability === "low to high") {
+//       sortedHotels = sortedHotels.sort((a, b) => a.total_rooms_available - b.total_rooms_available);
+//     } else if (sortHotelByRoomAvailability === "high to low") {
+//       sortedHotels = sortedHotels.sort((a, b) => b.total_rooms_available - a.total_rooms_available);
+//     }
+
+//     // 🔹 Step 6: Get total count
+//     const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
+
+//     const responseData = {
+//       success: true,
+//       totalHotels: countResult[0].total,
+//       currentPage: page,
+//       totalPages: Math.ceil(countResult[0].total / limit),
+//       data: sortedHotels,
+//     };
+
+//     setCache(cacheKey, responseData, 300);
+//     return res.status(200).json(responseData);
+
+//   } catch (err: any) {
+//      if (connection) connection.release();
+//     console.error("❌ Error filtering hotels:", err.message);
+//     next(err);
+//   } finally {
+//     if (connection) connection.release();
+//   }
+// };
 
 
-    const [reviews]= await connection.query<any[]>(
-      `SELECT hotel_id, rating, 
-      comment,review_date, cust.customer_name
-      FROM reviews
-       LEFT JOIN(
-       SELECT customer_id, full_name AS customer_name
-       FROM customers
-       )AS cust ON reviews.customer_id = cust.customer_id
-       WHERE hotel_id IN (?)`,
-      [hotelIds]
-    );
-const [reviewSummary] = await connection.query<any[]>(
-  `SELECT hotel_id,
-          ROUND(AVG(rating), 2) AS avg_rating,
-          COUNT(*) AS total_reviews
-   FROM reviews
-   WHERE hotel_id IN (?)
-   GROUP BY hotel_id`,
-  [hotelIds]
-);
+// const filterHotelsByRatings = async (req: Request, res: Response, next: NextFunction) => {
+//   let connection;
+//   try {
+//     connection = await db.getConnection();
 
-const [bookings] = await connection.query<any[]>(
-  `SELECT hotel_id,COUNT(*) AS total_bookings FROM bookings WHERE hotel_id IN (?)
-  AND booking_status NOT IN ('cancelled')
-  GROUP BY hotel_id`,
-  [hotelIds]
-)
+//     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
+//     const limit = 10;
+//     const offset = (page - 1) * limit;
+//     const ratings = (req.query.ratings as string)?.toLowerCase() || "";
 
-const totalBookings: Record<string, number> = {};
-for(const book of bookings){
-  totalBookings[book.hotel_id]= (totalBookings[book.hotel_id]||0) +1
-}
+//     const cacheKey = `hotels:sortByRating=${ratings}:page=${page}`;
+//     const cached = getCache<any>(cacheKey);
 
-// 🔹 Map average ratings for quick lookup
-const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
-for (const summary of reviewSummary) {
-  averageRatingOfHotels[summary.hotel_id] = {
-    avg_rating: summary.avg_rating,
-    total_reviews: summary.total_reviews,
-  };
-}
-    // 🔹 Step 4: Aggregate rooms & services by hotel
-    const hotelMap: Record<string, any> = {};
+//     if (cached) {
+//       console.log("⚡ Cache hit:", cacheKey);
+//       return res.status(200).json(cached);
+//     }
 
-    for (const hotel of hotels) {
-      hotelMap[hotel.hotel_id] = {
-        ...hotel,
-        total_rooms_available: availableRoomsCount[hotel.hotel_id] || 0, // ✅ computed
-                 average_rating: averageRatingOfHotels[hotel.hotel_id]?.avg_rating || 0,
-    total_reviews: averageRatingOfHotels[hotel.hotel_id]?.total_reviews || 0,
-    totalBookings: totalBookings[hotel.hotel_id] || 0,
-        rooms: [],
-        services: [],
-        reviews:[]
-      };
-    }
+//     console.log("🕵️ Cache miss:", cacheKey);
 
-    // Aggregate rooms
-    for (const room of rooms) {
-      const h = hotelMap[room.hotel_id];
-      if (h) {
-        h.rooms.push({
-          room_number: room.room_number,
-          room_type: room.room_type,
-          price_per_night: room.price_per_night,
-          is_available: room.is_available,
-        });
-        if (room.is_available) h.total_rooms_available++;
-      }
-    }
+//     // 🔹 Step 1: Get paginated hotels
+//     const [hotels] = await connection.query<any[]>(
+//       `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
+//        FROM hotels
+//        ORDER BY created_at DESC
+//        LIMIT ? OFFSET ?`,
+//       [limit, offset]
+//     );
 
-    // Aggregate services
-    for (const serv of services) {
-      const h = hotelMap[serv.hotel_id];
-      if (h) {
-        h.services.push({
-          service_id: serv.service_id,
-          service_name: serv.service_name,
-          service_charge: serv.service_charge,
-        });
-      }
-    }
-  for(const rev of reviews){
-      hotelMap[rev.hotel_id].reviews.push({
-        customer_name: rev.customer_name,
-        rating: rev.rating,
-        comment: rev.comment,
-        review_date: rev.review_date
-      })
-    }
-    // 🔹 Step 5: Sort hotels by available rooms (in-memory)
-    let sortedHotels = Object.values(hotelMap);
-    if (ratings === "low to high") {
-      sortedHotels = sortedHotels.sort((a, b) => a.average_rating - b.average_rating);
-    } else if (ratings === "high to low") {
-      sortedHotels = sortedHotels.sort((a, b) => b.average_rating - a.average_rating);
-    }
+//     if (hotels.length === 0) {
+//       return res.status(200).json({
+//         success: true,
+//         data: [],
+//         message: "No hotels found",
+//       });
+//     }
 
-    // 🔹 Step 6: Get total count
-    const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
+//     const hotelIds = hotels.map((h) => h.hotel_id);
 
-    const responseData = {
-      success: true,
-      totalHotels: countResult[0].total,
-      currentPage: page,
-      totalPages: Math.ceil(countResult[0].total / limit),
-      data: sortedHotels,
-    };
+//     // 🔹 Step 2: Get rooms and their availability
+//     const [rooms] = await connection.query<any[]>(
+//       `SELECT hotel_id, room_number, room_type, price_per_night, is_available
+//        FROM rooms
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+//     const availableRoomsCount: Record<string, number> = {};
+//     for (const room of rooms) {
+//       if (room.is_available) {
+//         availableRoomsCount[room.hotel_id] =availableRoomsCount[room.hotel_id] || 0;
+//       }
+//     }
+//     // 🔹 Step 3: Get services
+//     const [services] = await connection.query<any[]>(
+//       `SELECT hotel_id, service_id, service_name, service_charge
+//        FROM services
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
 
-    setCache(cacheKey, responseData, 300);
-    return res.status(200).json(responseData);
 
-  } catch (err: any) {
-     if (connection) await connection.rollback();
-    console.error("❌ Error filtering hotels:", err.message);
-    next(err);
-  } finally {
-    if (connection) connection.release();
-  }
-};
+//     const [reviews]= await connection.query<any[]>(
+//       `SELECT hotel_id, rating, 
+//       comment,review_date, cust.customer_name
+//       FROM reviews
+//        LEFT JOIN(
+//        SELECT customer_id, full_name AS customer_name
+//        FROM customers
+//        )AS cust ON reviews.customer_id = cust.customer_id
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+// const [reviewSummary] = await connection.query<any[]>(
+//   `SELECT hotel_id,
+//           ROUND(AVG(rating), 2) AS avg_rating,
+//           COUNT(*) AS total_reviews
+//    FROM reviews
+//    WHERE hotel_id IN (?)
+//    GROUP BY hotel_id`,
+//   [hotelIds]
+// );
 
-const filterHotelsByCityAndCountry = async (req: Request, res: Response, next: NextFunction) => {
+// const [bookings] = await connection.query<any[]>(
+//   `
+//   SELECT 
+//     b.booking_id, 
+//     b.hotel_id, 
+//     b.customer_id, 
+//     b.total_amount, 
+//     b.booking_status,
+//     cust.full_name AS customer_name,
+//     br.room_number, 
+//     br.check_in, 
+//     br.check_out, 
+//     br.room_amount,
+//     bc.cancel_reasons
+//   FROM bookings b
+//   LEFT JOIN customers cust ON b.customer_id = cust.customer_id
+//   LEFT JOIN booking_rooms br ON b.booking_id = br.booking_id
+//   LEFT JOIN bookings_cancelled bc ON b.booking_id = bc.booking_id
+//   WHERE b.hotel_id IN (?)
+//   ORDER BY b.created_at DESC
+//   `,
+//   [hotelIds]
+// );
+// const totalBookings: Record<string, number> = {};
+// for (const b of bookings) {
+//   if (b.booking_status !== "Cancelled") {
+//     totalBookings[b.hotel_id] = (totalBookings[b.hotel_id] || 0) + 1;
+//   }
+// }
+
+// // 🔹 Map average ratings for quick lookup
+// const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
+// for (const summary of reviewSummary) {
+//   averageRatingOfHotels[summary.hotel_id] = {
+//     avg_rating: summary.avg_rating,
+//     total_reviews: summary.total_reviews,
+//   };
+// }
+//     // 🔹 Step 4: Aggregate rooms & services by hotel
+//     const hotelMap: Record<string, any> = {};
+
+//     for (const hotel of hotels) {
+//       hotelMap[hotel.hotel_id] = {
+//         ...hotel,
+//         total_rooms_available: availableRoomsCount[hotel.hotel_id] || 0, // ✅ computed
+//                  average_rating: averageRatingOfHotels[hotel.hotel_id]?.avg_rating || 0,
+//     total_reviews: averageRatingOfHotels[hotel.hotel_id]?.total_reviews || 0,
+//     totalBookings: totalBookings[hotel.hotel_id] || 0,
+//         rooms: [],
+//         services: [],
+//         reviews:[],
+//         bookings:[]
+//       };
+//     }
+
+//     // Aggregate rooms
+//     for (const room of rooms) {
+//       const h = hotelMap[room.hotel_id];
+//       if (h) {
+//         h.rooms.push({
+//           room_number: room.room_number,
+//           room_type: room.room_type,
+//           price_per_night: room.price_per_night,
+//           is_available: room.is_available,
+//         });
+//         if (room.is_available) h.total_rooms_available++;
+//       }
+//     }
+
+//     // Aggregate services
+//     for (const serv of services) {
+//       const h = hotelMap[serv.hotel_id];
+//       if (h) {
+//         h.services.push({
+//           service_id: serv.service_id,
+//           service_name: serv.service_name,
+//           service_charge: serv.service_charge,
+//         });
+//       }
+//     }
+//   for(const rev of reviews){
+//       hotelMap[rev.hotel_id].reviews.push({
+//         customer_name: rev.customer_name,
+//         rating: rev.rating,
+//         comment: rev.comment,
+//         review_date: rev.review_date
+//       })
+//     }
+//     // 🧾 Step 8: Bookings (attach booking + room details)
+// for (const b of bookings) {
+//   const hotel = hotelMap[b.hotel_id];
+//   if (!hotel) continue;
+
+//   let existingBooking = hotel.bookings.find(
+//     (bk: any) => bk.booking_id === b.booking_id
+//   );
+
+//   if (!existingBooking) {
+//     existingBooking = {
+//       booking_id: b.booking_id,
+//       customer_name: b.customer_name,
+//       status: b.booking_status,
+//       total_amount: b.total_amount,
+//       cancel_reason: b.cancel_reasons || null,
+//       rooms: []
+      
+//     };
+//     hotel.bookings.push(existingBooking);
+//   }
+
+//   // Add room details to that booking
+//   existingBooking.rooms.push({
+//     room_number: b.room_number,
+//     check_in: b.check_in,
+//     check_out: b.check_out,
+//     room_amount: b.room_amount,
+//   });
+// }
+//     // 🔹 Step 5: Sort hotels by available rooms (in-memory)
+//     let sortedHotels = Object.values(hotelMap);
+//     if (ratings === "low to high") {
+//       sortedHotels = sortedHotels.sort((a, b) => a.average_rating - b.average_rating);
+//     } else if (ratings === "high to low") {
+//       sortedHotels = sortedHotels.sort((a, b) => b.average_rating - a.average_rating);
+//     }
+
+//     // 🔹 Step 6: Get total count
+//     const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
+
+//     const responseData = {
+//       success: true,
+//       totalHotels: countResult[0].total,
+//       currentPage: page,
+//       totalPages: Math.ceil(countResult[0].total / limit),
+//       data: sortedHotels,
+//     };
+
+//     setCache(cacheKey, responseData, 300);
+//     return res.status(200).json(responseData);
+
+//   } catch (err: any) {
+//      if (connection) connection.release();
+//     console.error("❌ Error filtering hotels:", err.message);
+//     next(err);
+//   } finally {
+//     if (connection) connection.release();
+//   }
+// };
+
+const filterHotels = async (req: Request, res: Response, next: NextFunction) => {
   let connection;
   try{
     connection = await db.getConnection();
@@ -847,7 +1004,12 @@ const filterHotelsByCityAndCountry = async (req: Request, res: Response, next: N
     //const sortHotelByRoomAvailability = (req.query.sortHotelByRoomAvailability as string)?.toLowerCase() || "";
     const searchCity = (req.query.city as string)?.toLowerCase() || "";
     const country = (req.query.country as string)?.toLowerCase() || "";
-    const cacheKey = `hotels:searchCity=${searchCity}:country=${country}:page=${page}`;
+   const ratings = req.query.ratings ? parseFloat(req.query.ratings as string) : 0;
+const sortHotelByRoomAvailability = (req.query.sortHotelByRoomAvailability as string)?.toLowerCase() || "";
+const bookingsCount = (req.query.bookingsCount as string)?.toLowerCase() || "";
+    const cacheKey = `hotels:searchCity=${searchCity}:
+    country=${country}:sortByAvailability=${sortHotelByRoomAvailability}
+    :sortByRating=${ratings}: bookingsCount=${bookingsCount}:page=${page}`;
     const cached = getCache<any>(cacheKey);
 
     if (cached) {
@@ -861,12 +1023,11 @@ const filterHotelsByCityAndCountry = async (req: Request, res: Response, next: N
     const [hotels] = await connection.query<any[]>(
       `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
        FROM hotels
-       WHERE LOWER(city) LIKE ? AND LOWER(country) LIKE ?
+       
        ORDER BY created_at DESC
        LIMIT ? OFFSET ?`,
-      [`%${searchCity}%`, `%${country}%`, limit, offset]
-    );
-
+      [ limit, offset]
+    )
     if (hotels.length === 0) {
       return res.status(200).json({
         success: true,
@@ -887,7 +1048,7 @@ const filterHotelsByCityAndCountry = async (req: Request, res: Response, next: N
     const availableRoomsCount: Record<string, number> = {};
     for (const room of rooms) {
       if (room.is_available) {
-        availableRoomsCount[room.hotel_id] =(availableRoomsCount[room.hotel_id] || 0) + 1;
+        availableRoomsCount[room.hotel_id] =availableRoomsCount[room.hotel_id] || 0;
       }
     }
     // 🔹 Step 3: Get services
@@ -921,16 +1082,35 @@ const [reviewSummary] = await connection.query<any[]>(
 );
 
 const [bookings] = await connection.query<any[]>(
-  `SELECT hotel_id,COUNT(*) AS total_bookings FROM bookings WHERE hotel_id IN (?)
-  AND booking_status NOT IN ('cancelled')
-  GROUP BY hotel_id`,
+  `
+  SELECT 
+    b.booking_id, 
+    b.hotel_id, 
+    b.customer_id, 
+    b.total_amount, 
+    b.booking_status,
+    cust.full_name AS customer_name,
+    br.room_number, 
+    br.check_in, 
+    br.check_out, 
+    br.room_amount,
+    bc.cancel_reasons
+  FROM bookings b
+  LEFT JOIN customers cust ON b.customer_id = cust.customer_id
+  LEFT JOIN booking_rooms br ON b.booking_id = br.booking_id
+  LEFT JOIN bookings_cancelled bc ON b.booking_id = bc.booking_id
+  WHERE b.hotel_id IN (?)
+  ORDER BY b.created_at DESC
+  `,
   [hotelIds]
-)
-
+);
 const totalBookings: Record<string, number> = {};
-for(const book of bookings){
-  totalBookings[book.hotel_id]= (totalBookings[book.hotel_id]||0) 
+for (const b of bookings) {
+  if (b.booking_status !== "Cancelled") {
+    totalBookings[b.hotel_id] = (totalBookings[b.hotel_id] || 0) + 1;
+  }
 }
+
 
 // 🔹 Map average ratings for quick lookup
 const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
@@ -952,7 +1132,8 @@ for (const summary of reviewSummary) {
     totalBookings: totalBookings[hotel.hotel_id] || 0,
         rooms: [],
         services: [],
-        reviews:[]
+        reviews:[],
+        bookings:[]
       };
     }
 
@@ -989,6 +1170,36 @@ for (const summary of reviewSummary) {
         review_date: rev.review_date
       })
     }
+    // 🧾 Step 8: Bookings (attach booking + room details)
+for (const b of bookings) {
+  const hotel = hotelMap[b.hotel_id];
+  if (!hotel) continue;
+
+  let existingBooking = hotel.bookings.find(
+    (bk: any) => bk.booking_id === b.booking_id
+  );
+
+  if (!existingBooking) {
+    existingBooking = {
+      booking_id: b.booking_id,
+      customer_name: b.customer_name,
+      status: b.booking_status,
+      total_amount: b.total_amount,
+      cancel_reason: b.cancel_reasons || null,
+      rooms: []
+      
+    };
+    hotel.bookings.push(existingBooking);
+  }
+
+  // Add room details to that booking
+  existingBooking.rooms.push({
+    room_number: b.room_number,
+    check_in: b.check_in,
+    check_out: b.check_out,
+    room_amount: b.room_amount,
+  });
+}
     // 🔹 Step 5: Sort hotels by available rooms (in-memory)
     let sortedHotels = Object.values(hotelMap);
     // if (searchCity === "low to high") {
@@ -996,23 +1207,54 @@ for (const summary of reviewSummary) {
     // } else if (searchCity === "high to low") {
     //   sortedHotels = sortedHotels.sort((a, b) => b.total_rooms_available - a.total_rooms_available);
     // }
-
+if (searchCity) {
+  sortedHotels = sortedHotels.filter(hotel =>
+    hotel.city.toLowerCase().includes(searchCity)
+  );
+}
+if (country) {
+  sortedHotels = sortedHotels.filter(hotel =>
+    hotel.country.toLowerCase().includes(country)
+  );
+}
+    if(ratings){
+      sortedHotels = sortedHotels.filter(h=>
+        h.average_rating >= ratings
+      )
+    }
+    if (sortHotelByRoomAvailability === "low to high") {
+      sortedHotels = sortedHotels.sort((a, b) =>
+         a.total_rooms_available - b.total_rooms_available);
+    } else if (sortHotelByRoomAvailability === "high to low") {
+      sortedHotels = sortedHotels.sort((a, b) => b.total_rooms_available - a.total_rooms_available);
+    }
+      if (bookingsCount === "low to high") {
+      sortedHotels = sortedHotels.sort((a, b) => a.total_bookings - b.total_bookings);
+    } else if (bookingsCount ==="high to low") {
+      sortedHotels = sortedHotels.sort((a, b) => b.total_bookings - a.total_bookings);
+    }
     // 🔹 Step 6: Get total count
-    const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
+    //const [countResult] = await connection.query<any[]>(`SELECT COUNT(*) AS total FROM hotels`);
+    const filteredHotels = sortedHotels;
+const totalHotels = filteredHotels.length;
+const totalPages = Math.ceil(totalHotels / limit);
+
+// Slice only the current page items (optional)
+const paginatedHotels = filteredHotels.slice((page - 1) * limit, page * limit);
 
     const responseData = {
       success: true,
-      totalHotels: countResult[0].total,
+      totalHotels: totalHotels,
       currentPage: page,
-      totalPages: Math.ceil(countResult[0].total / limit),
-      data: sortedHotels,
+      totalPages: totalPages,
+      data: paginatedHotels,
     };
 
     setCache(cacheKey, responseData, 300);
     return res.status(200).json(responseData);
 
   } catch (err: any) {
-     if (connection) await connection.rollback();
+     if (connection) connection.release();
     console.error("❌ Error filtering hotels:", err.message);
     next(err);
   } finally {
@@ -1021,11 +1263,243 @@ for (const summary of reviewSummary) {
   }
 };
 
+// const filterHotelsByBookingCount = async (req: Request, res: Response, next: NextFunction) => {
+//  let connection;
+//   try{
+//     connection = await db.getConnection();
+    
+//     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
+//     const limit = 10;
+//     const offset = (page - 1) * limit;
+//     //const sortHotelByRoomAvailability = (req.query.sortHotelByRoomAvailability as string)?.toLowerCase() || "";
+// const bookingsCount = (req.query.bookingsCount as string)?.toLowerCase() || "";
+//     const cacheKey = `hotels:bookingsCount=${bookingsCount}:page=${page}`;
+//     const cached = getCache<any>(cacheKey);
 
+//     if (cached) {
+//       console.log("⚡ Cache hit:", cacheKey);
+//       return res.status(200).json(cached);
+//     }
+
+//     console.log("🕵️ Cache miss:", cacheKey);
+
+//     // 🔹 Step 1: Get paginated hotels
+//     const [hotels] = await connection.query<any[]>(
+//       `SELECT hotel_id, hotel_name, city, country, total_rooms, created_at
+//        FROM hotels
+//        ORDER BY created_at DESC
+//        LIMIT ? OFFSET ?`,
+//       [limit, offset]
+//     );
+
+//     if (hotels.length === 0) {
+//       return res.status(200).json({
+//         success: true,
+//         data: [],
+//         message: "No hotels found",
+//       });
+//     }
+
+//     const hotelIds = hotels.map((h) => h.hotel_id);
+
+//     // 🔹 Step 2: Get rooms and their availability
+//     const [rooms] = await connection.query<any[]>(
+//       `SELECT hotel_id, room_number, room_type, price_per_night, is_available
+//        FROM rooms
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+//     const availableRoomsCount: Record<string, number> = {};
+//     for (const room of rooms) {
+//       if (room.is_available) {
+//         availableRoomsCount[room.hotel_id] =availableRoomsCount[room.hotel_id] || 0;
+//       }
+//     }
+//     // 🔹 Step 3: Get services
+//     const [services] = await connection.query<any[]>(
+//       `SELECT hotel_id, service_id, service_name, service_charge
+//        FROM services
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+
+
+//     const [reviews]= await connection.query<any[]>(
+//       `SELECT hotel_id, rating, 
+//       comment,review_date, cust.customer_name
+//       FROM reviews
+//        LEFT JOIN(
+//        SELECT customer_id, full_name AS customer_name
+//        FROM customers
+//        )AS cust ON reviews.customer_id = cust.customer_id
+//        WHERE hotel_id IN (?)`,
+//       [hotelIds]
+//     );
+// const [reviewSummary] = await connection.query<any[]>(
+//   `SELECT hotel_id,
+//           ROUND(AVG(rating), 2) AS avg_rating,
+//           COUNT(*) AS total_reviews
+//    FROM reviews
+//    WHERE hotel_id IN (?)
+//    GROUP BY hotel_id`,
+//   [hotelIds]
+// );
+
+// const [bookings] = await connection.query<any[]>(
+//   `
+//   SELECT 
+//     b.booking_id, 
+//     b.hotel_id, 
+//     b.customer_id, 
+//     b.total_amount, 
+//     b.booking_status,
+//     cust.full_name AS customer_name,
+//     br.room_number, 
+//     br.check_in, 
+//     br.check_out, 
+//     br.room_amount,
+//     bc.cancel_reasons
+//   FROM bookings b
+//   LEFT JOIN customers cust ON b.customer_id = cust.customer_id
+//   LEFT JOIN booking_rooms br ON b.booking_id = br.booking_id
+//   LEFT JOIN bookings_cancelled bc ON b.booking_id = bc.booking_id
+//   WHERE b.hotel_id IN (?)
+//   ORDER BY b.created_at DESC
+//   `,
+//   [hotelIds]
+// );
+// const totalBookings: Record<string, number> = {};
+// for (const b of bookings) {
+//   if (b.booking_status !== "Cancelled") {
+//     totalBookings[b.hotel_id] = (totalBookings[b.hotel_id] || 0) + 1;
+//   }
+// }
+
+
+// // 🔹 Map average ratings for quick lookup
+// const averageRatingOfHotels: Record<string, { avg_rating: number; total_reviews: number }> = {};
+// for (const summary of reviewSummary) {
+//   averageRatingOfHotels[summary.hotel_id] = {
+//     avg_rating: summary.avg_rating,
+//     total_reviews: summary.total_reviews,
+//   };
+// }
+//     // 🔹 Step 4: Aggregate rooms & services by hotel
+//     const hotelMap: Record<string, any> = {};
+
+//     for (const hotel of hotels) {
+//       hotelMap[hotel.hotel_id] = {
+//         ...hotel,
+//         total_rooms_available: availableRoomsCount[hotel.hotel_id] || 0, // ✅ computed
+//                  average_rating: averageRatingOfHotels[hotel.hotel_id]?.avg_rating || 0,
+//     total_reviews: averageRatingOfHotels[hotel.hotel_id]?.total_reviews || 0,
+//     totalBookings: totalBookings[hotel.hotel_id] || 0,
+//         rooms: [],
+//         services: [],
+//         reviews:[],
+//         bookings:[]
+//       };
+//     }
+
+//     // Aggregate rooms
+//     for (const room of rooms) {
+//       const h = hotelMap[room.hotel_id];
+//       if (h) {
+//         h.rooms.push({
+//           room_number: room.room_number,
+//           room_type: room.room_type,
+//           price_per_night: room.price_per_night,
+//           is_available: room.is_available,
+//         });
+//         if (room.is_available) h.total_rooms_available++;
+//       }
+//     }
+
+//     // Aggregate services
+//     for (const serv of services) {
+//       const h = hotelMap[serv.hotel_id];
+//       if (h) {
+//         h.services.push({
+//           service_id: serv.service_id,
+//           service_name: serv.service_name,
+//           service_charge: serv.service_charge,
+//         });
+//       }
+//     }
+//   for(const rev of reviews){
+//       hotelMap[rev.hotel_id].reviews.push({
+//         customer_name: rev.customer_name,
+//         rating: rev.rating,
+//         comment: rev.comment,
+//         review_date: rev.review_date
+//       })
+//     }
+//     // 🧾 Step 8: Bookings (attach booking + room details)
+// for (const b of bookings) {
+//   const hotel = hotelMap[b.hotel_id];
+//   if (!hotel) continue;
+
+//   let existingBooking = hotel.bookings.find(
+//     (bk: any) => bk.booking_id === b.booking_id
+//   );
+
+//   if (!existingBooking) {
+//     existingBooking = {
+//       booking_id: b.booking_id,
+//       customer_name: b.customer_name,
+//       status: b.booking_status,
+//       total_amount: b.total_amount,
+//       cancel_reason: b.cancel_reasons || null,
+//       rooms: []
+      
+//     };
+//     hotel.bookings.push(existingBooking);
+//   }
+
+//   // Add room details to that booking
+//   existingBooking.rooms.push({
+//     room_number: b.room_number,
+//     check_in: b.check_in,
+//     check_out: b.check_out,
+//     room_amount: b.room_amount,
+//   });
+// }
+//     // 🔹 Step 5: Sort hotels by available rooms (in-memory)
+//     let sortedHotels = Object.values(hotelMap);
+//     if (bookingsCount === "low to high") {
+//       sortedHotels = sortedHotels.sort((a, b) => a.total_bookings - b.total_bookings);
+//     } else if (bookingsCount === "high to low") {
+//       sortedHotels = sortedHotels.sort((a, b) => b.total_bookings - a.total_bookings);
+//     }
+
+//     // 🔹 Step 6: Get total count
+//     const [countResult] = await connection.query<any[]>(`SELECT 
+//       COUNT(*) AS total FROM hotels`);
+
+//     const responseData = {
+//       success: true,
+//       totalHotels: countResult[0].total,
+//       currentPage: page,
+//       totalPages: Math.ceil(countResult[0].total / limit),
+//       data: sortedHotels,
+//     };
+
+//     setCache(cacheKey, responseData, 300);
+//     return res.status(200).json(responseData);
+
+//   } catch (err: any) {
+//      if (connection) connection.release();
+//     console.error("❌ Error filtering hotels:", err.message);
+//     next(err);
+//   } finally {
+//     if (connection) connection.release();
+  
+//   }
+// }
 
 
 export { addHotel, updateHotel, 
   getAllHotelsWithRooms,
-  filterHotelsByRoomsAvailability
-,filterHotelsByRatings,filterHotelsByCityAndCountry
+  // filterHotelsByRoomsAvailability,
+filterHotels
 };

@@ -5,6 +5,7 @@ import hotelRoutes from "./admin/routes/hotelRoutes";
 import bookingRoutes from "./customers/routes/bookingRoutes";
 import reviewRoutes from "./customers/routes/reviewRoutes";
 import maintenanceRoutes from "./employees/routes/maintenanceRoutes";
+import customerRoutes from "./customers/routes/customerRoutes";
 
 const app=express();
 app.use(express.json());
@@ -15,6 +16,8 @@ app.use("/api/hotel", hotelRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/review", reviewRoutes);
 app.use("/api/maintenance", maintenanceRoutes);
+
+app.use("/api/customers",customerRoutes)
 
 app.use(errorHandler);
 app.listen(3000,()=>{
